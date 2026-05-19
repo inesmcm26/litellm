@@ -260,6 +260,57 @@ class MCPServerManager:
                 raw
             ).strip()
 
+    async def _ensure_upstream_initialize_instructions_cached(
+        self, server: MCPServer
+    ) -> None:
+        """
+        Open one upstream session and cache InitializeResult.instructions if missing.
+
+        No-op when YAML/DB instructions are set, server is OpenAPI (spec_path), the
+        cache is already populated, or auth preconditions match health_check_server's
+        skip rules (per-user auth / missing static auth token).
+        """
+        if server.spec_path:
+            return
+        if server.instructions and server.instructions.strip():
+            return
+        if self._upstream_initialize_instructions_by_server_id.get(server.server_id):
+            return
+        if server.requires_per_user_auth:
+            return
+        if (
+            server.auth_type
+            and server.auth_type != MCPAuth.none
+            and server.auth_type != MCPAuth.aws_sigv4
+            and not server.authentication_token
+        ):
+            return
+
+        try:
+            extra_headers: Optional[Dict[str, str]] = (
+                dict(server.static_headers) if server.static_headers else None
+            )
+            client = await self._create_mcp_client(
+                server=server,
+                mcp_auth_header=None,
+                extra_headers=extra_headers,
+                stdio_env=None,
+            )
+
+            async def _noop(_session):
+                return "ok"
+
+            await asyncio.wait_for(
+                client.run_with_session(_noop), timeout=MCP_HEALTH_CHECK_TIMEOUT
+            )
+            self._remember_upstream_initialize_instructions(server, client)
+        except Exception as e:
+            verbose_logger.debug(
+                "Upstream initialize instructions prefetch failed for %s: %s",
+                server.name,
+                e,
+            )
+
     def get_registry(self) -> Dict[str, MCPServer]:
         """
         Get the registered MCP Servers from the registry and union with the config MCP Servers
